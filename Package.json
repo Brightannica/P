@@ -1,0 +1,16 @@
+{
+  "name": "stealth-reverse-proxy",
+  "version": "1.0.0",
+  "description": "Stealth dynamic reverse proxy for Render",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "http-proxy-middleware": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
