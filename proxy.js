@@ -20,9 +20,8 @@ const parseCookies = (cookieHeader) => {
     return list;
 };
 
-// Sleek, minimalist dark-mode launcher UI for root visits
+// Sleek dark-mode launcher UI for root visits
 const renderLandingPage = (req, res) => {
-    const host = req.headers['host'];
     res.setHeader('Content-Type', 'text/html');
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -56,7 +55,7 @@ const renderLandingPage = (req, res) => {
         function launchProxy(e) {
             e.preventDefault();
             let val = document.getElementById('targetInput').value.trim();
-            if (!val.startsWith('http://') && !val.startsWith('https://')) {
+            if (!/^https?:\/\//i.test(val)) {
                 val = 'https://' + val;
             }
             const encoded = btoa(val);
@@ -77,12 +76,17 @@ const dynamicProxy = (req, res, next) => {
     if (pxMatch && pxMatch[1]) {
         try {
             let b64 = pxMatch[1].split('&')[0];
+            // Fix spaces turned into '+' or missing padding
+            b64 = b64.replace(/ /g, '+');
+            while (b64.length % 4) {
+                b64 += '=';
+            }
             targetUrl = Buffer.from(b64, 'base64').toString('utf8');
         } catch (e) {
-            return res.status(400).json({ error: 'Invalid encoded target format' });
+            return res.status(400).json({ error: 'Invalid encoded target format', details: e.message });
         }
     } else {
-        // Fall back to sticky session cookie for sub-requests, video chunks, and API calls
+        // Fall back to sticky session cookie for sub-requests and API calls
         const cookies = parseCookies(req.headers.cookie);
         if (cookies._px_target) {
             targetOrigin = cookies._px_target;
@@ -90,7 +94,7 @@ const dynamicProxy = (req, res, next) => {
         }
     }
 
-    // If root path and no active session or parameter, render gorgeous landing UI
+    // If root path and no active session or parameter, render launcher UI
     if (!targetUrl || (req.url === '/' && !pxMatch && !targetOrigin)) {
         return renderLandingPage(req, res);
     }
@@ -102,7 +106,8 @@ const dynamicProxy = (req, res, next) => {
         }
     }
 
-    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+    // Case-insensitive protocol check & fix
+    if (!/^https?:\/\//i.test(targetUrl)) {
         targetUrl = 'https://' + targetUrl;
     }
 
@@ -127,7 +132,7 @@ const dynamicProxy = (req, res, next) => {
             pathRewrite: () => parsedTarget.pathname + parsedTarget.search,
             on: {
                 proxyReq: (proxyReq) => {
-                    // Spoof robust browser headers tailored for media streaming & anti-bot bypass
+                    // Spoof robust browser headers for anti-bot & media streaming bypass
                     proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
                     proxyReq.setHeader('Accept-Language', 'en-US,en;q=0.9');
                     proxyReq.setHeader('Origin', origin);
@@ -136,12 +141,10 @@ const dynamicProxy = (req, res, next) => {
                     proxyReq.setHeader('Sec-Ch-Ua-Mobile', '?0');
                     proxyReq.setHeader('Sec-Ch-Ua-Platform', '"Windows"');
                     
-                    // CRITICAL: Strip Accept-Encoding to prevent upstream compression corrupting stream/script inspection
                     proxyReq.removeHeader('accept-encoding');
                     proxyReq.removeHeader('X-Powered-By');
                 },
                 proxyRes: (proxyRes, req, res) => {
-                    // Scrub proxy footprints
                     delete proxyRes.headers['x-powered-by'];
                     delete proxyRes.headers['server'];
                     delete proxyRes.headers['via'];
@@ -153,12 +156,11 @@ const dynamicProxy = (req, res, next) => {
                     delete proxyRes.headers['cross-origin-opener-policy'];
                     delete proxyRes.headers['cross-origin-embedder-policy'];
 
-                    // Permissive CORS headers
                     proxyRes.headers['Access-Control-Allow-Origin'] = '*';
                     proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
                     proxyRes.headers['Access-Control-Allow-Headers'] = '*';
 
-                    // Rewrite redirect locations to keep traffic inside the proxy domain
+                    // Rewrite redirect locations to keep traffic inside proxy domain
                     if (proxyRes.headers['location']) {
                         let loc = proxyRes.headers['location'];
                         if (loc.startsWith(origin)) {
@@ -168,7 +170,7 @@ const dynamicProxy = (req, res, next) => {
                         }
                     }
 
-                    // Sanitize Set-Cookie headers so target session tokens work across domains
+                    // Sanitize Set-Cookie headers for cross-site compatibility
                     if (proxyRes.headers['set-cookie']) {
                         proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
                             return cookie
@@ -179,9 +181,14 @@ const dynamicProxy = (req, res, next) => {
                     }
                 },
                 error: (err, req, res) => {
-                    console.error('Proxy Error:', err.message);
+                    console.error(`[Proxy Error] Code: ${err.code} | Message: ${err.message} | Target: ${targetUrl}`);
                     if (!res.headersSent) {
-                        res.status(502).send('Bad Gateway');
+                        res.status(502).json({
+                            error: 'Bad Gateway',
+                            details: err.message,
+                            code: err.code,
+                            target: targetUrl
+                        });
                     }
                 }
             }
@@ -190,17 +197,16 @@ const dynamicProxy = (req, res, next) => {
         return proxy(req, res, next);
     } catch (err) {
         console.error('URL Parse Error:', err.message);
-        return res.status(400).json({ error: 'Invalid target URL format' });
+        return res.status(400).json({ error: 'Invalid target URL format', details: err.message });
     }
 };
 
 app.use('/', dynamicProxy);
 
 const server = app.listen(PORT, () => {
-    console.log(`Elite Stealth Proxy running on port ${PORT}`);
+    console.log(`Hardened Stealth Proxy running on port ${PORT}`);
 });
 
-// Robust WebSocket upgrade handling for live video sockets and player streaming
 server.on('upgrade', (req, socket, head) => {
-    // WebSocket routing is managed natively via http-proxy-middleware ws: true
+    // WebSocket upgrade handling managed via http-proxy-middleware ws: true
 });
