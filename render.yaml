@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: render-reverse-proxy
+    runtime: node
+    plan: free
+    region: oregon # or frankfurt, ohio, singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TARGET_URL
+        value: ""
+      - key: QUERY_PARAM_KEY
+        value: "url"
+      - key: PROXY_SECRET
+        generateValue: true # Generates a secure random secret token automatically
