@@ -7,7 +7,6 @@ const PROXY_SECRET = process.env.PROXY_SECRET || '';
 
 app.disable('x-powered-by');
 
-// Simple cookie parser helper
 const parseCookies = (cookieHeader) => {
     const list = {};
     if (!cookieHeader) return list;
@@ -24,24 +23,18 @@ const dynamicProxy = (req, res, next) => {
     let targetUrl = process.env.TARGET_URL;
     let targetOrigin = null;
 
-    // 1. Check for explicit ?q= (Base64) or ?url=
-    const qMatch = req.url.match(/[?&]q=([^&]+)/);
-    const urlMatch = req.url.match(/[?&]url=([^&]+)/);
+    // Check for dedicated Base64 control parameter ?_px=
+    const pxMatch = req.url.match(/[?&]_px=([^&]+)/);
 
-    if (qMatch && qMatch[1]) {
+    if (pxMatch && pxMatch[1]) {
         try {
-            targetUrl = Buffer.from(qMatch[1], 'base64').toString('utf8');
+            let b64 = pxMatch[1].split('&')[0];
+            targetUrl = Buffer.from(b64, 'base64').toString('utf8');
         } catch (e) {
-            return res.status(400).json({ error: 'Invalid encoded target' });
-        }
-    } else if (urlMatch && urlMatch[1]) {
-        try {
-            targetUrl = decodeURIComponent(urlMatch[1]);
-        } catch (e) {
-            targetUrl = urlMatch[1];
+            return res.status(400).json({ error: 'Invalid encoded target format' });
         }
     } else {
-        // 2. Fall back to sticky session cookie for background sub-requests
+        // Fall back to sticky session cookie for background sub-requests, video chunks, and API calls
         const cookies = parseCookies(req.headers.cookie);
         if (cookies._px_target) {
             targetOrigin = cookies._px_target;
@@ -49,7 +42,7 @@ const dynamicProxy = (req, res, next) => {
         }
     }
 
-    if (!targetUrl || (req.url === '/' && !urlMatch && !qMatch && !targetOrigin)) {
+    if (!targetUrl || (req.url === '/' && !pxMatch && !targetOrigin)) {
         return res.status(404).send('Not Found');
     }
 
@@ -67,13 +60,14 @@ const dynamicProxy = (req, res, next) => {
     try {
         const parsedTarget = new URL(targetUrl);
         const origin = parsedTarget.origin;
+        const currentHost = req.headers['host'];
 
-        // Set sticky cookie for background sub-requests
+        // Set sticky session cookie for subsequent sub-requests
         res.cookie('_px_target', origin, {
             httpOnly: true,
             secure: true,
             sameSite: 'None',
-            maxAge: 3600000 // 1 hour session
+            maxAge: 7200000 // 2 hours
         });
 
         const proxy = createProxyMiddleware({
@@ -81,43 +75,56 @@ const dynamicProxy = (req, res, next) => {
             changeOrigin: true,
             ws: true,
             xfwd: true,
-            cookieDomainRewrite: { '*': '' },
             pathRewrite: () => parsedTarget.pathname + parsedTarget.search,
             on: {
                 proxyReq: (proxyReq) => {
-                    // Spoof browser headers tailored for media streaming & YouTube
-                    const fakeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-                    proxyReq.setHeader('User-Agent', fakeUserAgent);
+                    // Spoof robust browser headers tailored for media streaming
+                    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
                     proxyReq.setHeader('Accept-Language', 'en-US,en;q=0.9');
                     proxyReq.setHeader('Origin', origin);
                     proxyReq.setHeader('Referer', origin + '/');
-                    proxyReq.setHeader('Sec-Ch-Ua', '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"');
+                    proxyReq.setHeader('Sec-Ch-Ua', '"Chromium";v="123", "Not:A-Brand";v="8", "Google Chrome";v="123"');
                     proxyReq.setHeader('Sec-Ch-Ua-Mobile', '?0');
                     proxyReq.setHeader('Sec-Ch-Ua-Platform', '"Windows"');
-                    proxyReq.setHeader('Sec-Fetch-Dest', 'iframe');
-                    proxyReq.setHeader('Sec-Fetch-Mode', 'navigate');
-                    proxyReq.setHeader('Sec-Fetch-Site', 'cross-site');
-                    
-                    // Scrub identifying headers
                     proxyReq.removeHeader('X-Powered-By');
                 },
-                proxyRes: (proxyRes) => {
-                    // Scrub server fingerprint headers
+                proxyRes: (proxyRes, req, res) => {
+                    // Scrub proxy footprints
                     delete proxyRes.headers['x-powered-by'];
                     delete proxyRes.headers['server'];
                     delete proxyRes.headers['via'];
                     delete proxyRes.headers['x-proxied-by'];
 
-                    // CRITICAL: Strip strict CSP and frame restrictions so YouTube/embeds load inside iframes
+                    // Strip strict security headers that block iframe embedding
                     delete proxyRes.headers['content-security-policy'];
                     delete proxyRes.headers['x-frame-options'];
                     delete proxyRes.headers['cross-origin-opener-policy'];
                     delete proxyRes.headers['cross-origin-embedder-policy'];
 
-                    // Permissive CORS headers for cross-origin playback
+                    // Permissive CORS headers
                     proxyRes.headers['Access-Control-Allow-Origin'] = '*';
                     proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
                     proxyRes.headers['Access-Control-Allow-Headers'] = '*';
+
+                    // Rewrite redirect locations to keep traffic inside the proxy domain
+                    if (proxyRes.headers['location']) {
+                        let loc = proxyRes.headers['location'];
+                        if (loc.startsWith(origin)) {
+                            proxyRes.headers['location'] = `https://${currentHost}${loc.substring(origin.length)}`;
+                        } else if (loc.startsWith('/')) {
+                            proxyRes.headers['location'] = `https://${currentHost}${loc}`;
+                        }
+                    }
+
+                    // Sanitize Set-Cookie headers so target session tokens work across domains
+                    if (proxyRes.headers['set-cookie']) {
+                        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
+                            return cookie
+                                .replace(/;\s*secure/gi, '')
+                                .replace(/;\s*samesite=[^;]+/gi, '')
+                                .replace(/domain=[^;]+/gi, '') + '; SameSite=None; Secure';
+                        });
+                    }
                 },
                 error: (err, req, res) => {
                     console.error('Proxy Error:', err.message);
@@ -133,10 +140,10 @@ const dynamicProxy = (req, res, next) => {
         console.error('URL Parse Error:', err.message);
         return res.status(400).json({ error: 'Invalid target URL format' });
     }
-};
+});
 
 app.use('/', dynamicProxy);
 
 app.listen(PORT, () => {
-    console.log(`Media-Ready Stealth proxy running on port ${PORT}`);
+    console.log(`Ultimate Stealth Proxy running on port ${PORT}`);
 });
