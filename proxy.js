@@ -8,17 +8,23 @@ const PROXY_SECRET = process.env.PROXY_SECRET || ''; // Optional secret token
 // Disable Express fingerprinting
 app.disable('x-powered-by');
 
-// Benign root landing page to prevent proxy disclosure
-app.get('/', (req, res) => {
-    res.status(404).send('Not Found');
-});
-
 // Dynamic proxy handler middleware
 const dynamicProxy = (req, res, next) => {
-    let targetUrl = req.query.url || process.env.TARGET_URL;
+    // Extract the raw URL string after ?url= to preserve nested query params like ?s=1&e=5
+    let targetUrl = process.env.TARGET_URL;
+    const urlMatch = req.url.match(/[?&]url=([^&]+)/);
+    
+    if (urlMatch && urlMatch[1]) {
+        try {
+            targetUrl = decodeURIComponent(urlMatch[1]);
+        } catch (e) {
+            targetUrl = urlMatch[1];
+        }
+    }
 
-    if (!targetUrl) {
-        return res.status(400).json({ error: 'Missing target URL parameter (?url=)' });
+    // If no target URL is provided anywhere, show benign 404 landing page
+    if (!targetUrl || req.url === '/' || req.url === '') {
+        return res.status(404).send('Not Found');
     }
 
     // Optional Security Token Check
@@ -43,23 +49,22 @@ const dynamicProxy = (req, res, next) => {
             ws: true,
             xfwd: true,
             pathRewrite: (path, req) => {
+                // Forward the exact target pathname and its query string
                 return parsedTarget.pathname + parsedTarget.search;
             },
             on: {
                 proxyReq: (proxyReq, req, res) => {
-                    // Spoof standard browser headers to look authentic
                     proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                     proxyReq.setHeader('Accept-Language', 'en-US,en;q=0.9');
                     proxyReq.removeHeader('X-Powered-By');
                 },
                 proxyRes: (proxyRes, req, res) => {
-                    // Scrub response headers to hide proxy footprint
                     delete proxyRes.headers['x-powered-by'];
                     delete proxyRes.headers['server'];
                     delete proxyRes.headers['via'];
                     delete proxyRes.headers['x-proxied-by'];
 
-                    // Permissive CORS for embedding / cross-origin iframes
+                    // Permissive CORS for embedding / iframes
                     proxyRes.headers['Access-Control-Allow-Origin'] = '*';
                     proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
                     proxyRes.headers['Access-Control-Allow-Headers'] = '*';
