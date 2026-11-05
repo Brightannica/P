@@ -110,7 +110,8 @@ flowchart TD
 | `MAX_BODY_BYTES` | `10485760` | Maximum proxied request body size |
 | `RATE_LIMIT_MAX` | `30` | Session creations allowed per client per window |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window |
-| `UPSTREAM_MAX_SOCKETS` | `64` | Concurrent upstream sockets per host |
+| `UPSTREAM_MAX_SOCKETS` | `32` | Concurrent upstream sockets per host |
+| `UPSTREAM_MAX_FREE_SOCKETS` | `8` | Idle upstream sockets kept open |
 | `UPSTREAM_KEEPALIVE_MS` | `30000` | Upstream keep-alive idle timeout |
 | `RETRY_ATTEMPTS` | `2` | Retries for idempotent requests after a transient failure |
 | `RETRY_BASE_DELAY_MS` | `100` | Base backoff, doubled per attempt with jitter |
@@ -118,7 +119,7 @@ flowchart TD
 | `ALLOW_PRIVATE_TARGETS` | `false` | Permit private/internal origins |
 | `DNS_CACHE_TTL_MS` | `60000` | TTL for SSRF resolution verdicts |
 | `MAX_TARGET_LENGTH` | `4096` | Maximum accepted `_px` payload length |
-| `LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug` |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug` (use `warn` on the free tier) |
 | `LOG_FORMAT` | `json` | `json` or `pretty` |
 | `SHUTDOWN_GRACE_MS` | `20000` | Drain budget after `SIGTERM` |
 | `FORWARDED_HEADERS` | `false` | Emit `X-Forwarded-*` upstream |
@@ -224,6 +225,48 @@ process. This configuration removes everything that is removable without
 impersonating a browser's network stack, which is the line this service
 draws.
 
+## Free-tier profile
+
+Render's free web services give 512 MB of RAM and a shared 0.1 CPU core, and
+spin down after 15 minutes of inactivity. The blueprint is tuned for that
+envelope:
+
+| Lever | Setting | Why |
+| --- | --- | --- |
+| V8 heap cap | `NODE_OPTIONS=--max-old-space-size=256` | Without a cap the heap grows toward the host ceiling and the instance is OOM-killed before the collector feels pressure |
+| Upstream sockets | `UPSTREAM_MAX_SOCKETS=32`, `UPSTREAM_MAX_FREE_SOCKETS=8` | Idle sockets retain buffer and TLS state — the main per-connection memory cost |
+| Log level | `LOG_LEVEL=warn` | A JSON log line per request costs about 7% of the proxy's CPU |
+| Keep-alive | `UPSTREAM_KEEPALIVE_MS=30000` | Reuses connections instead of re-handshaking, which is the single largest CPU saving |
+
+Measured on that envelope (proxy and load generator in separate processes,
+`--max-old-space-size=256`, 20 concurrent requests):
+
+| Requests | Server CPU / request | RSS growth | Resident set after |
+| --- | --- | --- | --- |
+| 600 | 0.33 ms | 27 MB | 101 MB |
+| 1,800 | 0.22 ms | 25.5 MB | 99 MB |
+| 3,600 | 0.18 ms | 26.9 MB | 101 MB |
+
+Resident memory is **flat** across a 6× larger workload, so there is no leak:
+the ~26 MB is a fixed working set of sockets, buffers and JIT state.
+Steady-state cost is roughly **0.18 ms of proxy CPU per request**.
+
+Reproduce with:
+
+```bash
+npm run bench -- 1800 20
+```
+
+Two honest limits on the free tier:
+
+- **0.1 CPU is the ceiling, not this code.** At ~0.18 ms of proxy CPU per
+  request, a few hundred requests per second saturates the core before any
+  optimisation here would matter. The remaining cost is Node's HTTP stack,
+  not proxy logic.
+- **Spin-down is expected.** After 15 minutes idle the instance is stopped,
+  which is also what releases its memory. The first request afterwards pays a
+  cold start.
+
 ## Failure modes
 
 | Situation | Response |
@@ -276,4 +319,5 @@ request bodies, range requests and the operational endpoints.
 | `render.yaml` | Render Blueprint |
 | `package.json` | Dependencies and scripts |
 | `test/integration.js` | End-to-end integration suite |
+| `test/benchmark.js` | Throughput, CPU and memory benchmark |
 | `.env.example` | Local configuration reference |

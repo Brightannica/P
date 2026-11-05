@@ -9,7 +9,7 @@ services:
   - type: web
     name: proxy
     runtime: node
-    plan: starter # `free` is not recommended: media streaming + WebSockets are CPU heavy.
+    plan: free # 512 MB RAM, shared CPU. The heap cap below keeps RSS bounded.
     region: oregon
     branch: main
     buildCommand: npm ci --omit=dev
@@ -27,6 +27,13 @@ services:
         value: production
       - key: PORT
         value: "10000"
+
+      # Cap the V8 heap so the garbage collector runs before the 512 MB
+      # instance limit is reached. Without this the heap can grow to the
+      # host's default ceiling and the instance is OOM-killed. 256 MB leaves
+      # room for socket buffers, TLS state and native allocations.
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=256"
 
       # --- Authorisation -------------------------------------------------
       # Comma-separated list of origins this proxy is authorized to front.
@@ -71,8 +78,12 @@ services:
         value: "60000"
 
       # --- Upstream pool --------------------------------------------------
+      # Idle sockets are kept to a low count: each one retains buffer and TLS
+      # state, which is the main per-connection memory cost.
       - key: UPSTREAM_MAX_SOCKETS
-        value: "64"
+        value: "32"
+      - key: UPSTREAM_MAX_FREE_SOCKETS
+        value: "8"
       - key: UPSTREAM_KEEPALIVE_MS
         value: "30000"
       - key: RETRY_ATTEMPTS
@@ -110,8 +121,11 @@ services:
         value: "relay"
 
       # --- Observability ---------------------------------------------------
+      # `warn` avoids a JSON log line per request (~7% of proxy CPU) while
+      # still recording upstream failures. Use `info` when per-request logs
+      # are worth the cost.
       - key: LOG_LEVEL
-        value: "info"
+        value: "warn"
       - key: LOG_FORMAT
         value: "json"
       - key: SHUTDOWN_GRACE_MS

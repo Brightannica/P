@@ -756,6 +756,29 @@ async function main() {
     assert.ok(bodies.every((body) => body.includes('console.log("asset")')), 'a body was corrupted');
   });
 
+  await scenario('metrics expose process memory for capacity planning', async () => {
+    const res = await fetch(`${PROXY_ORIGIN}/metrics`);
+    const body = await res.text();
+    assert.ok(
+      /px_process_resident_memory_bytes \d+/.test(body),
+      'resident memory gauge missing'
+    );
+    assert.ok(/px_process_heap_used_bytes \d+/.test(body), 'heap gauge missing');
+  });
+
+  await scenario('upstream cookies keep working when the proxy sets them', async () => {
+    const res = await fetch(`${PROXY_ORIGIN}/echo`, { headers: { Cookie: sticky } });
+    const cookies = setCookies(res);
+    assert.ok(
+      cookies.some((cookie) => cookie.startsWith('secure_sid=')),
+      'upstream cookie was dropped'
+    );
+    assert.ok(
+      cookies.some((cookie) => cookie.startsWith('_px_target=')),
+      'sticky cookie was dropped'
+    );
+  });
+
   section('Operational endpoints');
 
   await scenario('health, readiness and metrics are exposed', async () => {

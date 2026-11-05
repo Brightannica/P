@@ -112,8 +112,9 @@ const CONFIG = {
   retryAttempts: num(process.env.RETRY_ATTEMPTS, 2),
   retryBaseDelayMs: num(process.env.RETRY_BASE_DELAY_MS, 100),
   /** Upstream connection pool sizing. */
-  upstreamMaxSockets: num(process.env.UPSTREAM_MAX_SOCKETS, 64),
+  upstreamMaxSockets: num(process.env.UPSTREAM_MAX_SOCKETS, 32),
   upstreamKeepAliveMs: num(process.env.UPSTREAM_KEEPALIVE_MS, 30 * 1000),
+  upstreamMaxFreeSockets: num(process.env.UPSTREAM_MAX_FREE_SOCKETS, 8),
   /** SSRF containment. */
   ssrfGuard: process.env.SSRF_GUARD !== 'false',
   allowPrivateTargets: process.env.ALLOW_PRIVATE_TARGETS === 'true',
@@ -262,6 +263,14 @@ function isBrowserLike(proxyReq) {
 
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 
+/**
+ * Whether a level would be emitted. Hot paths use this to avoid building a
+ * payload object that would only be discarded.
+ */
+function logEnabled(level) {
+  return (LOG_LEVELS[level] ?? 2) <= (LOG_LEVELS[CONFIG.logLevel] ?? 2);
+}
+
 function log(level, message, fields) {
   if ((LOG_LEVELS[level] ?? 2) > (LOG_LEVELS[CONFIG.logLevel] ?? 2)) return;
 
@@ -313,6 +322,7 @@ function observeDuration(durationMs) {
 }
 
 function renderMetrics() {
+  const memory = process.memoryUsage();
   const lines = [
     '# HELP px_requests_total Total HTTP requests handled.',
     '# TYPE px_requests_total counter',
@@ -351,6 +361,12 @@ function renderMetrics() {
     '# HELP px_active_requests Requests currently in flight.',
     '# TYPE px_active_requests gauge',
     `px_active_requests ${METRICS.active}`,
+    '# HELP px_process_resident_memory_bytes Resident set size of the process.',
+    '# TYPE px_process_resident_memory_bytes gauge',
+    `px_process_resident_memory_bytes ${memory.rss}`,
+    '# HELP px_process_heap_used_bytes V8 heap currently in use.',
+    '# TYPE px_process_heap_used_bytes gauge',
+    `px_process_heap_used_bytes ${memory.heapUsed}`,
     '# HELP px_request_duration_ms Request duration in milliseconds.',
     '# TYPE px_request_duration_ms histogram',
   ];
@@ -386,7 +402,7 @@ function createUpstreamAgent() {
     keepAlive: true,
     keepAliveMsecs: CONFIG.upstreamKeepAliveMs,
     maxSockets: CONFIG.upstreamMaxSockets,
-    maxFreeSockets: Math.min(CONFIG.upstreamMaxSockets, 32),
+    maxFreeSockets: CONFIG.upstreamMaxFreeSockets,
     scheduling: 'lifo',
   };
 
@@ -397,7 +413,7 @@ function createUpstreamAgent() {
     // Node reads these to decide whether a connection may be reused.
     keepAlive: true,
     maxSockets: CONFIG.upstreamMaxSockets,
-    maxFreeSockets: Math.min(CONFIG.upstreamMaxSockets, 32),
+    maxFreeSockets: CONFIG.upstreamMaxFreeSockets,
     keepAliveMsecs: CONFIG.upstreamKeepAliveMs,
 
     addRequest(req, requestOptions) {
@@ -636,11 +652,11 @@ function compileAllowlist(entries) {
 const ALLOWLIST = compileAllowlist(CONFIG.allowedOrigins);
 const STRIP_ALLOWLIST = compileAllowlist(CONFIG.stripHeadersOrigins);
 
-function matchesAllowlist(allowlist, url) {
+function matchesAllowlist(allowlist, target) {
   if (allowlist.allowAll) return true;
-  if (allowlist.origins.has(url.origin)) return true;
+  if (allowlist.origins.has(target.origin)) return true;
 
-  const host = url.hostname.toLowerCase();
+  const host = target.hostname.toLowerCase();
   if (allowlist.hosts.has(host)) return true;
 
   for (const suffix of allowlist.suffixes) {
@@ -650,18 +666,18 @@ function matchesAllowlist(allowlist, url) {
   return false;
 }
 
-function isOriginAllowed(url) {
-  return matchesAllowlist(ALLOWLIST, url);
+function isOriginAllowed(target) {
+  return matchesAllowlist(ALLOWLIST, target);
 }
 
-function isHeaderStripAllowed(url) {
-  return matchesAllowlist(STRIP_ALLOWLIST, url);
+function isHeaderStripAllowed(target) {
+  return matchesAllowlist(STRIP_ALLOWLIST, target);
 }
 
-function credentialsFor(url) {
+function credentialsFor(target) {
   return (
-    ALLOWLIST.credentials.get(url.host) ||
-    ALLOWLIST.credentials.get(url.hostname.toLowerCase()) ||
+    ALLOWLIST.credentials.get(target.host) ||
+    ALLOWLIST.credentials.get(target.hostname.toLowerCase()) ||
     null
   );
 }
@@ -671,6 +687,7 @@ function credentialsFor(url) {
  * ------------------------------------------------------------------ */
 
 const dnsCache = new Map();
+const DNS_CACHE_MAX = 256;
 
 /** True for addresses that must never be reached through the proxy. */
 function isPrivateAddress(address) {
@@ -703,7 +720,12 @@ function isPrivateAddress(address) {
 
 async function resolveHostAddresses(hostname) {
   const cached = dnsCache.get(hostname);
-  if (cached && cached.expires > Date.now()) return cached.addresses;
+  if (cached && cached.expires > Date.now()) {
+    // Refresh recency for the least-recently-used eviction below.
+    dnsCache.delete(hostname);
+    dnsCache.set(hostname, cached);
+    return cached.addresses;
+  }
 
   let addresses;
   try {
@@ -713,7 +735,12 @@ async function resolveHostAddresses(hostname) {
     throw new Error(`DNS lookup failed for ${hostname}: ${error.code || error.message}`);
   }
 
-  if (dnsCache.size > 1000) dnsCache.clear();
+  // Bounded cache: evict the least recently used entry rather than clearing
+  // the whole map, which keeps memory flat without losing warm entries.
+  if (dnsCache.size >= DNS_CACHE_MAX) {
+    const oldest = dnsCache.keys().next().value;
+    if (oldest !== undefined) dnsCache.delete(oldest);
+  }
   dnsCache.set(hostname, { addresses, expires: Date.now() + CONFIG.dnsCacheTtlMs });
   return addresses;
 }
@@ -745,6 +772,7 @@ async function assertSafeTarget(url) {
  * ------------------------------------------------------------------ */
 
 const rateBuckets = new Map();
+const RATE_BUCKETS_MAX = 5000;
 
 /** Sliding-window limiter keyed by client address. */
 function checkRateLimit(key, limit, windowMs) {
@@ -760,6 +788,14 @@ function checkRateLimit(key, limit, windowMs) {
 
   hits.push(now);
   rateBuckets.set(key, hits);
+
+  // Bound the table so a spray of distinct addresses cannot grow it without
+  // limit; the sweep below reclaims the rest.
+  if (rateBuckets.size > RATE_BUCKETS_MAX) {
+    const oldest = rateBuckets.keys().next().value;
+    if (oldest !== undefined) rateBuckets.delete(oldest);
+  }
+
   return true;
 }
 
@@ -809,6 +845,7 @@ async function resolveTargetUncached(req) {
   let basePath = null;
   let baseSearch = '';
   let explicit = false;
+  let parsedTarget = null;
 
   if (entry) {
     explicit = true;
@@ -842,6 +879,7 @@ async function resolveTargetUncached(req) {
     }
 
     origin = url.origin;
+    parsedTarget = url;
     basePath = url.pathname && url.pathname !== '/' ? url.pathname.replace(/\/+$/, '') : '/';
     baseSearch = url.search || '';
   } else {
@@ -861,6 +899,7 @@ async function resolveTargetUncached(req) {
     }
 
     origin = stickyUrl.origin;
+    parsedTarget = stickyUrl;
 
     const stickyBase = readCookie(req, BASE_COOKIE);
     if (stickyBase) {
@@ -923,17 +962,27 @@ async function resolveTargetUncached(req) {
   // this is the exact upstream path and query.
   req.url = `${upstreamPath}${upstreamSearch}`;
 
-  const targetUrl = new URL(upstreamUrl);
+  // A lightweight description of the upstream. Parsing the assembled URL
+  // again would cost a URL parse on every request, so the pieces are taken
+  // from the target that was already parsed.
+  const target = {
+    origin,
+    hostname: parsedTarget.hostname,
+    host: parsedTarget.host,
+    protocol: parsedTarget.protocol,
+    href: upstreamUrl,
+  };
+
   const resolution = {
     ok: true,
     origin,
     upstreamUrl,
     explicit,
     baseUrl: `${origin}${basePath}${baseSearch}`,
-    targetUrl,
+    target,
     needsRedirect,
     redirectPath,
-    credentials: credentialsFor(targetUrl),
+    credentials: credentialsFor(target),
     attempts: 0,
   };
 
@@ -1464,16 +1513,19 @@ app.use((req, res, next) => {
     const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
     METRICS.requests++;
     observeDuration(durationMs);
-    log('info', 'request', {
-      requestId: req.requestId,
-      method: req.method,
-      // The path only: query strings routinely carry tokens.
-      path: String(req.originalUrl || req.url || '/').split('?')[0],
-      status: res.statusCode,
-      durationMs: Number(durationMs.toFixed(2)),
-      clientIp: clientKey(req),
-      target: req.px && req.px.ok ? req.px.origin : undefined,
-    });
+    // The payload is only built when the level would actually be emitted.
+    if (logEnabled('info')) {
+      log('info', 'request', {
+        requestId: req.requestId,
+        method: req.method,
+        // The path only: query strings routinely carry tokens.
+        path: String(req.originalUrl || req.url || '/').split('?')[0],
+        status: res.statusCode,
+        durationMs: Number(durationMs.toFixed(2)),
+        clientIp: clientKey(req),
+        target: req.px && req.px.ok ? req.px.origin : undefined,
+      });
+    }
   };
 
   res.on('finish', settle);
@@ -1731,9 +1783,14 @@ proxyMiddleware = createProxyMiddleware({
         proxyReq.removeHeader(header);
       }
 
-      // Keep the sticky-session cookies on the proxy side.
+      // Keep the sticky-session cookies on the proxy side. The common case is
+      // a request that carries no proxy cookies at all, so the header is left
+      // untouched rather than parsed and rebuilt.
       const incomingCookie = proxyReq.getHeader('cookie');
-      if (incomingCookie) {
+      if (
+        incomingCookie &&
+        (incomingCookie.includes(STICKY_COOKIE) || incomingCookie.includes(BASE_COOKIE))
+      ) {
         const filtered = parseCookieHeader(incomingCookie);
         delete filtered[STICKY_COOKIE];
         delete filtered[BASE_COOKIE];
@@ -1856,7 +1913,7 @@ proxyMiddleware = createProxyMiddleware({
       const resolution = req.px;
       const targetOrigin = resolution && resolution.ok ? resolution.origin : null;
       const stripAllowed =
-        resolution && resolution.ok ? isHeaderStripAllowed(resolution.targetUrl) : false;
+        resolution && resolution.ok ? isHeaderStripAllowed(resolution.target) : false;
 
       METRICS.upstreamRequests++;
       if (resolution && resolution.upstreamStartedAt) {
@@ -1939,7 +1996,10 @@ proxyMiddleware = createProxyMiddleware({
       if (!resolution || !resolution.ok) return;
 
       const incomingCookie = proxyReq.getHeader('cookie');
-      if (incomingCookie) {
+      if (
+        incomingCookie &&
+        (incomingCookie.includes(STICKY_COOKIE) || incomingCookie.includes(BASE_COOKIE))
+      ) {
         const filtered = parseCookieHeader(incomingCookie);
         delete filtered[STICKY_COOKIE];
         delete filtered[BASE_COOKIE];
