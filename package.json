@@ -1,26 +1,28 @@
 {
-  "name": "stealth-calc",
-  "version": "1.0.0",
+  "name": "proxy",
+  "version": "2.0.0",
   "private": true,
+  "description": "Production-grade sticky-session reverse proxy with pooled connections, media streaming and WebSocket support, optimized for Render.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test/integration.js",
+    "health": "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
   },
   "dependencies": {
-    "lucide-react": "^0.454.0",
-    "next": "^14.2.15",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "express": "^4.19.2",
+    "http-proxy-middleware": "^3.0.3"
   },
-  "devDependencies": {
-    "@types/node": "^20",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.47",
-    "tailwindcss": "^3.4.14",
-    "typescript": "^5"
-  }
+  "keywords": [
+    "reverse-proxy",
+    "http-proxy-middleware",
+    "render",
+    "streaming",
+    "websocket"
+  ],
+  "license": "MIT"
 }

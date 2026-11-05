@@ -1,14 +1,125 @@
+# Render deployment blueprint
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Set the `sync: false` variables in the Render dashboard before the first
+# deploy. The rate limiter and session state are held in process memory, so
+# this blueprint pins the service to a single instance.
+
 services:
   - type: web
-    name: stealth-calc
+    name: proxy
     runtime: node
-    plan: starter
-    buildCommand: npm install && npm run build
-    startCommand: npm run start
-    healthCheckPath: /
+    plan: starter # `free` is not recommended: media streaming + WebSockets are CPU heavy.
+    region: oregon
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
     autoDeploy: true
+    autoDeployTrigger: commit
+    # Rate-limit and session state live in process memory, so keep this
+    # service at a single instance. Scaling out requires a shared store
+    # (for example Redis) plus a raised instance count in the dashboard.
     envVars:
       - key: NODE_VERSION
-        value: "20.11.1"
-      - key: NEXT_TELEMETRY_DISABLED
+        value: "18.20.4"
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+
+      # --- Authorisation -------------------------------------------------
+      # Comma-separated list of origins this proxy is authorized to front.
+      # Entries may be full origins (`https://example.com`), bare hosts
+      # (`example.com`), host patterns (`*.example.com`), or host entries
+      # carrying upstream credentials (`user:pass@example.com`).
+      # `*` disables the allowlist (not recommended).
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Origins for which restrictive response headers (CSP, X-Frame-Options,
+      # COOP, COEP) may be stripped. Defaults to ALLOWED_ORIGINS when unset.
+      - key: STRIP_SECURITY_HEADERS_ORIGINS
+        sync: false
+      # Optional bearer token required in front of the whole proxy.
+      # Leave empty to disable. Health probes stay reachable either way.
+      - key: PROXY_ACCESS_TOKEN
+        sync: false
+      # Optional HTTP Basic credentials. Browsers send Basic credentials on
+      # navigations automatically, so this is the browser-friendly option.
+      - key: PROXY_ACCESS_USER
+        sync: false
+      - key: PROXY_ACCESS_PASSWORD
+        sync: false
+
+      # --- Routing and CORS ----------------------------------------------
+      - key: ENABLE_CORS
+        value: "true"
+      # Public origin of this deployment, used to rewrite absolute redirects.
+      # Leave empty to derive it from the incoming Host header.
+      - key: PUBLIC_ORIGIN
+        sync: false
+      # Target pre-filled in the launcher UI.
+      - key: EXAMPLE_TARGET
+        sync: false
+
+      # --- Limits ---------------------------------------------------------
+      - key: MAX_BODY_BYTES
+        value: "10485760"
+      - key: RATE_LIMIT_MAX
+        value: "30"
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+
+      # --- Upstream pool --------------------------------------------------
+      - key: UPSTREAM_MAX_SOCKETS
+        value: "64"
+      - key: UPSTREAM_KEEPALIVE_MS
+        value: "30000"
+      - key: RETRY_ATTEMPTS
+        value: "2"
+      - key: RETRY_BASE_DELAY_MS
+        value: "100"
+
+      # --- SSRF containment ------------------------------------------------
+      - key: SSRF_GUARD
+        value: "true"
+      # Set to true only when proxying an internal origin on a private network.
+      - key: ALLOW_PRIVATE_TARGETS
+        value: "false"
+
+      # --- Signal fidelity --------------------------------------------------
+      # A browser's own fingerprint is self-consistent, so relaying it is
+      # more faithful than synthesising one. Non-browser clients are
+      # normalised onto the built-in browser profile.
+      # Emit X-Forwarded-* upstream (a clear proxy tell). Default: false.
+      - key: FORWARDED_HEADERS
+        value: "false"
+      # Relay the correlation id upstream. Default: false.
+      - key: FORWARD_REQUEST_ID
+        value: "false"
+      # Always replace the client fingerprint with the built-in profile.
+      # Default: false (browser clients are relayed verbatim).
+      - key: OVERRIDE_FINGERPRINT
+        value: "false"
+      # Drop accept-encoding instead of relaying the client's negotiation.
+      # Default: false.
+      - key: STRIP_ACCEPT_ENCODING
+        value: "false"
+      # Origin/Referer handling: relay | always | never. Default: relay.
+      - key: ORIGIN_HEADERS_MODE
+        value: "relay"
+
+      # --- Observability ---------------------------------------------------
+      - key: LOG_LEVEL
+        value: "info"
+      - key: LOG_FORMAT
+        value: "json"
+      - key: SHUTDOWN_GRACE_MS
+        value: "20000"
+
+      # --- Platform --------------------------------------------------------
+      # Number of trusted proxy hops used to resolve the client address.
+      # Render places one edge in front of the service, so 1 is correct and
+      # keeps the rate limiter resistant to forged forwarding headers.
+      - key: TRUST_PROXY
         value: "1"
